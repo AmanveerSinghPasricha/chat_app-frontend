@@ -1,0 +1,29 @@
+/* Reset */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* Prevent page scrolling completely */
+html,
+body {
+  height: 100%;
+  width: 100%;
+  background: #0b0d1a;
+  overflow: hidden;
+}
+
+/* React root must be fixed height */
+#root {
+  height: 100%;
+  width: 100%;
+  background: #0b0d1a;
+  overflow: hidden;
+}
+
+/* Optional */
+a {
+  color: inherit;
+  text-decoration: none;
+}
