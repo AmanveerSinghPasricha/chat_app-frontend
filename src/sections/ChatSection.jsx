@@ -1,3 +1,4 @@
+// src/sections/ChatSection.jsx
 import React, { useEffect, useRef, useState } from "react";
 import {
   Box,
@@ -14,6 +15,16 @@ import {
 } from "@mui/material";
 
 import { api } from "../api/api";
+
+// E2EE
+import {
+  ensureDeviceRegistered,
+  ensureIdentityKeypair,
+  ensurePrekeysUploaded,
+  ensureSessionForFriend,
+} from "../e2ee/e2eeClient";
+
+import { encryptMessage, decryptMessage } from "../e2ee/cryptoUtils";
 
 export default function ChatSection() {
   const [me, setMe] = useState(null);
@@ -38,6 +49,14 @@ export default function ChatSection() {
 
   const token = localStorage.getItem("access_token");
 
+  // E2EE session state
+  const sessionRef = useRef({
+    sessionKeyB64: null,
+    header: null,
+    myDeviceId: null,
+    receiverDeviceId: null,
+  });
+
   const scrollToBottom = (behavior = "auto") => {
     setTimeout(() => {
       const el = messagesBoxRef.current;
@@ -61,6 +80,17 @@ export default function ChatSection() {
     }
   };
 
+  const normalizeError = (e, fallback) => {
+    const detail = e?.response?.data?.detail;
+
+    // FastAPI validation errors array
+    if (Array.isArray(detail)) {
+      return detail.map((x) => x?.msg).filter(Boolean).join(", ") || fallback;
+    }
+
+    return detail || e?.response?.data?.message || e?.message || fallback;
+  };
+
   // -----------------------------
   // Fetch Logged-in User (ME)
   // -----------------------------
@@ -70,7 +100,7 @@ export default function ChatSection() {
       setMe(res?.data?.data || null);
     } catch (e) {
       setMe(null);
-      setError(e?.response?.data?.detail || "Failed to fetch user profile");
+      setError(normalizeError(e, "Failed to fetch user profile"));
     }
   };
 
@@ -88,14 +118,14 @@ export default function ChatSection() {
       setFriends(Array.isArray(data) ? data : []);
     } catch (e) {
       setFriends([]);
-      setError(e?.response?.data?.detail || "Failed to load friends");
+      setError(normalizeError(e, "Failed to load friends"));
     } finally {
       setLoadingFriends(false);
     }
   };
 
   // -----------------------------
-  // Open Chat with Friend
+  // Open Chat with Friend (E2EE)
   // -----------------------------
   const openChatWithFriend = async (friend) => {
     try {
@@ -103,57 +133,120 @@ export default function ChatSection() {
       setSelectedFriend(friend);
       setConversationId(null);
       setMessages([]);
-
       closeSocket();
       setLoadingMessages(true);
+
+      if (!token) {
+        throw new Error("No token found. Please login again.");
+      }
+
+      // 0) E2EE Setup (device + identity + prekeys)
+      const myDeviceId = await ensureDeviceRegistered();
+      await ensureIdentityKeypair();
+      await ensurePrekeysUploaded();
 
       // 1) Start/Get conversation
       const convRes = await api.post(`/chat/conversations/${friend.id}`);
       const convId = convRes?.data?.data?.conversation_id;
 
-      if (!convId) {
-        throw new Error("Conversation ID missing from API response");
-      }
-
+      if (!convId) throw new Error("Conversation ID missing from API response");
       setConversationId(convId);
 
-      // 2) Load history
+      // 2) Create session for this friend (derive key + receiverDeviceId)
+      const session = await ensureSessionForFriend(friend);
+
+      sessionRef.current.sessionKeyB64 = session.sessionKeyB64;
+      sessionRef.current.header = session.header;
+      sessionRef.current.myDeviceId = myDeviceId;
+      sessionRef.current.receiverDeviceId = session.receiverDeviceId;
+
+      // 3) Load history (encrypted history)
       const msgRes = await api.get(`/chat/messages/${convId}`);
       const msgData = msgRes?.data?.data;
+      const list = Array.isArray(msgData) ? msgData : [];
 
-      setMessages(Array.isArray(msgData) ? msgData : []);
+      const decryptedList = await Promise.all(
+        list.map(async (m) => {
+          if (m?.ciphertext && m?.nonce) {
+            try {
+              const plain = await decryptMessage(
+                sessionRef.current.sessionKeyB64,
+                m.ciphertext,
+                m.nonce
+              );
+              return { ...m, content: plain };
+            } catch {
+              return { ...m, content: "[Unable to decrypt]" };
+            }
+          }
 
-      // ✅ scroll after history is loaded
+          // fallback for old plaintext backend messages
+          return { ...m, content: m?.content || "" };
+        })
+      );
+
+      setMessages(decryptedList);
       setForceScrollTick((x) => x + 1);
 
-      // 3) Open WebSocket
-      if (!token) {
-        throw new Error("No token found. Please login again.");
-      }
-
+      // 4) Open WebSocket
       const wsUrl = `wss://chat-app-gbuw.onrender.com/chat/ws/${convId}?token=${token}`;
       const ws = new WebSocket(wsUrl);
 
-      ws.onmessage = (event) => {
+      ws.onopen = () => {
+        console.log("WS connected");
+      };
+
+      ws.onmessage = async (event) => {
         try {
-          const data = JSON.parse(event.data);
-          if (!data?.content) return;
+          if (typeof event.data !== "string") return;
 
-          setMessages((prev) => {
-            const exists = prev.some(
-              (m) =>
-                String(m.id) === String(data.id) ||
-                (m.content === data.content &&
-                  String(m.sender_id) === String(data.sender_id) &&
-                  String(m.created_at) === String(data.created_at))
-            );
-            if (exists) return prev;
-            return [...prev, data];
-          });
+          const raw = event.data.trim();
 
-          setForceScrollTick((x) => x + 1);
-        } catch {
-          // ignore invalid payload
+          // ignore non-json payloads
+          if (!raw || (raw[0] !== "{" && raw[0] !== "[")) {
+            console.log("WS non-json:", raw);
+            return;
+          }
+
+          const data = JSON.parse(raw);
+
+          // encrypted payload
+          if (data?.ciphertext && data?.nonce) {
+            let plain = "[Unable to decrypt]";
+            try {
+              plain = await decryptMessage(
+                sessionRef.current.sessionKeyB64,
+                data.ciphertext,
+                data.nonce
+              );
+            } catch {
+              // ignore
+            }
+
+            const msg = { ...data, content: plain };
+
+            setMessages((prev) => {
+              const exists = prev.some((m) => String(m.id) === String(msg.id));
+              if (exists) return prev;
+              return [...prev, msg];
+            });
+
+            setForceScrollTick((x) => x + 1);
+            return;
+          }
+
+          // plaintext payload (old backend)
+          if (data?.content) {
+            setMessages((prev) => {
+              const exists = prev.some((m) => String(m.id) === String(data.id));
+              if (exists) return prev;
+              return [...prev, data];
+            });
+
+            setForceScrollTick((x) => x + 1);
+          }
+        } catch (err) {
+          console.log("WS parse error:", err, "RAW:", event.data);
         }
       };
 
@@ -161,20 +254,30 @@ export default function ChatSection() {
         setError("WebSocket error. Please try again.");
       };
 
+      ws.onclose = () => {
+        console.log("WS closed");
+      };
+
       wsRef.current = ws;
     } catch (e) {
-      setError(e?.response?.data?.detail || e?.message || "Failed to open chat");
+      setError(normalizeError(e, "Failed to open chat"));
     } finally {
       setLoadingMessages(false);
     }
   };
 
   // -----------------------------
-  // Send Message
+  // Send Message (E2EE)
   // -----------------------------
   const sendMessage = async () => {
-    if (!wsRef.current || wsRef.current.readyState !== 1) {
+    if (!wsRef.current) {
       setError("WebSocket not connected yet.");
+      return;
+    }
+
+    // must be OPEN
+    if (wsRef.current.readyState !== 1) {
+      setError("WebSocket still connecting. Try again in 1 second.");
       return;
     }
 
@@ -185,17 +288,52 @@ export default function ChatSection() {
       setSending(true);
       setError("");
 
+      const sessionKeyB64 = sessionRef.current.sessionKeyB64;
+      if (!sessionKeyB64) {
+        throw new Error("Session key not ready. Re-open chat.");
+      }
+
+      const receiverDeviceId = sessionRef.current.receiverDeviceId;
+      if (!receiverDeviceId) {
+        throw new Error("Receiver device_id missing. Re-open chat.");
+      }
+
+      const myDeviceId = sessionRef.current.myDeviceId;
+      if (!myDeviceId) {
+        throw new Error("Your device_id missing. Re-open chat.");
+      }
+
+      // encrypt
+      const encrypted = await encryptMessage(sessionKeyB64, trimmed);
+
+      // send encrypted payload
       wsRef.current.send(
         JSON.stringify({
-          content: trimmed,
+          ciphertext: encrypted.ciphertext,
+          nonce: encrypted.nonce,
+          sender_device_id: myDeviceId,
+          receiver_device_id: receiverDeviceId,
+          header: sessionRef.current.header,
+          message_type: "text",
         })
       );
 
-      setText("");
+      // ✅ IMPORTANT FIX:
+      // Show message instantly in UI (optimistic)
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `local-${Date.now()}`,
+          sender_id: me?.id,
+          content: trimmed,
+          created_at: new Date().toISOString(),
+        },
+      ]);
 
+      setText("");
       setForceScrollTick((x) => x + 1);
-    } catch {
-      setError("Failed to send message");
+    } catch (e) {
+      setError(normalizeError(e, "Failed to send message"));
     } finally {
       setSending(false);
     }
@@ -207,27 +345,15 @@ export default function ChatSection() {
   useEffect(() => {
     fetchMe();
     fetchFriends();
-
     return () => closeSocket();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // -----------------------------
-  // MAIN FIX: Always scroll when:
-  // - messages change
-  // - friend changes
-  // - tab switches back (component re-renders)
-  // We force it using forceScrollTick
-  // -----------------------------
+  // scroll whenever messages update
   useEffect(() => {
     if (!selectedFriend) return;
     scrollToBottom("auto");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [forceScrollTick, selectedFriend, conversationId]);
 
-  // -----------------------------
-  // UI
-  // -----------------------------
   return (
     <Box
       sx={{
@@ -238,7 +364,7 @@ export default function ChatSection() {
         overflow: "hidden",
       }}
     >
-      {/* LEFT: FRIENDS LIST */}
+      {/* LEFT */}
       <Paper
         sx={{
           width: 320,
@@ -293,12 +419,8 @@ export default function ChatSection() {
                   selected={selectedFriend?.id === f.id}
                   onClick={() => openChatWithFriend(f)}
                   sx={{
-                    "&.Mui-selected": {
-                      bgcolor: "rgba(108,99,255,0.18)",
-                    },
-                    "&.Mui-selected:hover": {
-                      bgcolor: "rgba(108,99,255,0.25)",
-                    },
+                    "&.Mui-selected": { bgcolor: "rgba(108,99,255,0.18)" },
+                    "&.Mui-selected:hover": { bgcolor: "rgba(108,99,255,0.25)" },
                   }}
                 >
                   <ListItemText
@@ -320,7 +442,7 @@ export default function ChatSection() {
         </Box>
       </Paper>
 
-      {/* RIGHT: CHAT WINDOW */}
+      {/* RIGHT */}
       <Paper
         sx={{
           flex: 1,
@@ -334,17 +456,10 @@ export default function ChatSection() {
         }}
       >
         {/* HEADER */}
-        <Box
-          sx={{
-            p: 2,
-            borderBottom: "1px solid rgba(255,255,255,0.08)",
-            flexShrink: 0,
-          }}
-        >
+        <Box sx={{ p: 2, borderBottom: "1px solid rgba(255,255,255,0.08)" }}>
           <Typography variant="h6" fontWeight={900} sx={{ color: "#fff" }}>
             {selectedFriend ? selectedFriend.username : "Chat"}
           </Typography>
-
           <Typography sx={{ color: "rgba(255,255,255,0.6)", fontSize: 13 }}>
             {selectedFriend ? selectedFriend.email : "Select a friend to begin"}
           </Typography>
@@ -361,7 +476,7 @@ export default function ChatSection() {
                 border: "1px solid rgba(211, 47, 47, 0.35)",
               }}
             >
-              {error}
+              {String(error)}
             </Alert>
           </Box>
         )}
@@ -443,7 +558,6 @@ export default function ChatSection() {
             borderTop: "1px solid rgba(255,255,255,0.08)",
             display: "flex",
             gap: 1,
-            flexShrink: 0,
           }}
         >
           <TextField
