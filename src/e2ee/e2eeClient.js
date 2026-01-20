@@ -42,17 +42,13 @@ export async function ensureDeviceRegistered() {
 
   const payload = {
     device_name: "web",
-    identity_key_pub: identity.publicKey, // REQUIRED by backend
+    identity_key_pub: identity.publicKey,
   };
 
   const res = await api.post("/e2ee/devices/register", payload);
 
-  // backend returns data.id (NOT device_id)
   const deviceId = res?.data?.data?.id;
-
-  if (!deviceId) {
-    throw new Error("Device register failed: id missing");
-  }
+  if (!deviceId) throw new Error("Device register failed: id missing");
 
   await saveDeviceId(deviceId);
   return deviceId;
@@ -68,12 +64,11 @@ export async function ensurePrekeysUploaded() {
   const deviceId = await ensureDeviceRegistered();
   const identity = await ensureIdentityKeypair();
 
-  // Backend expects ONLY signed_prekey + one_time_prekeys
   const payload = {
     signed_prekey: {
       key_id: 1,
       public_key: identity.publicKey,
-      signature: identity.publicKey, // placeholder for now
+      signature: identity.publicKey, // placeholder
     },
 
     one_time_prekeys: Array.from({ length: 5 }).map((_, idx) => ({
@@ -82,7 +77,6 @@ export async function ensurePrekeysUploaded() {
     })),
   };
 
-  // backend expects device_id in QUERY param
   await api.post(`/e2ee/prekeys/upload?device_id=${deviceId}`, payload);
 
   await setPrekeysUploaded(true);
@@ -93,14 +87,20 @@ export async function ensurePrekeysUploaded() {
 // 4) Fetch Friend Bundle
 // -------------------------
 export async function fetchFriendBundle(friendUserId) {
-  const res = await api.get(`/e2ee/prekeys/bundle/${friendUserId}`);
-  const bundle = res?.data?.data;
-
-  if (!bundle) {
-    throw new Error("Friend bundle missing from API response");
+  try {
+    const res = await api.get(`/e2ee/prekeys/bundle/${friendUserId}`);
+    const bundle = res?.data?.data;
+    if (!bundle) throw new Error("Friend bundle missing from API response");
+    return bundle;
+  } catch (e) {
+    const status = e?.response?.status;
+    if (status === 404) {
+      throw new Error(
+        "Friend has no E2EE device/prekeys yet. Ask them to login once so device registers + prekeys upload."
+      );
+    }
+    throw e;
   }
-
-  return bundle;
 }
 
 // -------------------------
@@ -121,24 +121,14 @@ export async function ensureSessionForFriend(friend) {
   const friendBundle = await fetchFriendBundle(friend.id);
 
   const receiverDeviceId = friendBundle?.device_id;
-  if (!receiverDeviceId) {
-    throw new Error("Friend bundle missing device_id");
+  if (!receiverDeviceId) throw new Error("Friend bundle missing device_id");
+
+  if (!friendBundle?.identity_key_pub || friendBundle.identity_key_pub === "string") {
+    throw new Error("Friend bundle identity_key_pub is invalid (backend issue)");
   }
 
-  // Must be real base64 (not placeholder)
-  if (
-    !friendBundle?.identity_key_pub ||
-    friendBundle.identity_key_pub === "string"
-  ) {
-    throw new Error(
-      "Friend bundle identity_key_pub is not real. Fix backend bundle to return actual key."
-    );
-  }
-
-  // Generate ephemeral keypair
   const eph = await generateEphemeralKeypair();
 
-  // Derive session key using friend identity pub + my eph priv
   const sessionKeyB64 = await deriveSessionKeyFromBundle({
     friendBundle,
     myEphemeralPrivB64: eph.privateKey,
@@ -147,7 +137,6 @@ export async function ensureSessionForFriend(friend) {
   await saveSessionKey(friend.id, sessionKeyB64);
   await saveReceiverDeviceId(friend.id, receiverDeviceId);
 
-  // Header for receiver to derive (future use)
   const header = {
     ephemeral_pub: eph.publicKey,
     signed_prekey_id: friendBundle?.signed_prekey?.key_id ?? null,

@@ -1,8 +1,17 @@
 // src/e2ee/cryptoUtils.js
 // Minimal + stable WebCrypto E2EE helpers (ECDH -> HKDF -> AES-GCM)
 
+function normalizeB64(b64) {
+  return String(b64 || "")
+    .trim()
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+}
+
 function b64ToBytes(b64) {
-  const bin = atob(b64);
+  const clean = normalizeB64(b64);
+
+  const bin = atob(clean);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes;
@@ -100,23 +109,20 @@ async function hkdfToAesKey(sharedSecretBits) {
 
 // ----------------------------
 // Derive session key from friend's bundle
-// friendBundle must contain: identity_key_pub (base64 raw ECDH pubkey)
-// myEphemeralPrivKeyStr must be: JSON string (private JWK)
 // ----------------------------
 export async function deriveSessionKeyFromBundle({
   friendBundle,
   myEphemeralPrivKeyStr,
-  myEphemeralPrivB64, // support your e2eeClient.js naming
+  myEphemeralPrivB64,
 }) {
   const receiverIdentityPub = friendBundle?.identity_key_pub;
   if (!receiverIdentityPub) {
     throw new Error("friendBundle.identity_key_pub missing");
   }
 
-  // ✅ accept either name
   const privStr = myEphemeralPrivKeyStr || myEphemeralPrivB64;
   if (!privStr) {
-    throw new Error("Missing ephemeral private key (myEphemeralPrivKeyStr)");
+    throw new Error("Missing ephemeral private key");
   }
 
   const receiverPubKey = await importEcdhPublicKey(receiverIdentityPub);
@@ -136,8 +142,6 @@ export async function deriveSessionKeyFromBundle({
 
 // ----------------------------
 // AES-GCM Encrypt/Decrypt
-// sessionKeyB64 must decode to 32 bytes
-// nonce is 12 bytes (base64)
 // ----------------------------
 async function importAesKey(sessionKeyB64) {
   const raw = b64ToBytes(sessionKeyB64);
@@ -159,7 +163,7 @@ export async function encryptMessage(sessionKeyB64, plaintext) {
   const ciphertextBuf = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
     key,
-    new TextEncoder().encode(plaintext)
+    new TextEncoder().encode(String(plaintext))
   );
 
   return {
